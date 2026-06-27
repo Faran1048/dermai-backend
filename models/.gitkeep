@@ -1,0 +1,4 @@
+# models/
+# Place downloaded model weights here (.pt, .pth, .safetensors, .onnx).
+# This directory is intentionally kept empty in version control.
+# Add models/ to .gitignore to avoid committing large binary files.

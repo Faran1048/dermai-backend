@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Local databases and cache
+.env
+dermai.db
+model_cache/
+uploads/
+tmp/
+tmp_hf/
+data/

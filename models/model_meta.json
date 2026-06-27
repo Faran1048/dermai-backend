@@ -1,0 +1,40 @@
+{
+  "model_arch": "efficientnet_b4",
+  "num_classes": 10,
+  "class_names": [
+    "melanoma",
+    "basal_cell_carcinoma",
+    "actinic_keratosis",
+    "melanocytic_nevi",
+    "benign_keratosis",
+    "vascular_lesion",
+    "petechiae_purpura",
+    "leukemia_cutis",
+    "ecchymosis",
+    "normal_skin"
+  ],
+  "class_descriptions": {
+    "melanoma": "Malignant melanoma \u2014 high-risk skin cancer. Urgent referral required.",
+    "basal_cell_carcinoma": "Basal cell carcinoma \u2014 most common skin cancer. Dermatologist visit within 2 weeks.",
+    "actinic_keratosis": "Actinic keratosis \u2014 pre-cancerous lesion from UV damage.",
+    "melanocytic_nevi": "Melanocytic nevus (common mole) \u2014 benign.",
+    "benign_keratosis": "Benign keratosis-like lesion \u2014 benign.",
+    "vascular_lesion": "Vascular lesion \u2014 usually benign.",
+    "petechiae_purpura": "Petechiae/Purpura \u2014 minor hemorrhage. Monitor.",
+    "leukemia_cutis": "Leukemia cutis \u2014 leukemia infiltration. Urgent referral.",
+    "ecchymosis": "Ecchymosis \u2014 bruising or bleeding under the skin.",
+    "normal_skin": "Normal skin \u2014 no active lesions detected."
+  },
+  "checkpoint_total_outputs": 10,
+  "active_trained_outputs": 10,
+  "img_size": 300,
+  "best_val_acc": 0.0,
+  "epochs_completed": 1,
+  "note": "Locally fine-tuned efficientnet_b4 classifier on Kaggle datasets.",
+  "high_risk_classes": [
+    "melanoma",
+    "basal_cell_carcinoma",
+    "leukemia_cutis"
+  ],
+  "disclaimer": "Educational tool only. Not a medical device."
+}
