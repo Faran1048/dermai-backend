@@ -1,41 +1,51 @@
+
 """
 algorithms/cnn_classifier.py
 
 EfficientNet-B4 skin lesion classifier.
 
-Trained on HAM10000-derived dataset, 5 classes (86.9% val accuracy):
-  0 - melanoma            (High-risk malignant)
-  1 - basal_cell_carcinoma (High-risk malignant)
-  2 - melanocytic_nevi    (Benign - common mole)
-  3 - benign_keratosis    (Benign)
-  4 - vascular_lesion     (Benign)
+The classifier uses the local checkpoint:
+    models/dermai_best.pt
 
-NOTE: The checkpoint classifier head has 10 output neurons — only the first 5
-(indices 0-4) correspond to trained classes. Outputs 5-9 are unused dead neurons.
-We extract logits[0:5], run softmax over them only, so confidences correctly
-sum to 1.0 and reflect actual model training.
+Class labels are read from the model metadata when available and checked
+against the configured output classes.
+
+IMPORTANT:
+- No random or mock predictions are generated.
+- If the trained model cannot load, classification is unavailable.
+- This is an experimental educational tool, not a medical diagnostic device.
 """
 
+import json
+import logging
+from pathlib import Path
+
+import timm
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-# pyrefly: ignore [missing-import]
-import timm, json
-from PIL import Image
-from pathlib import Path
-# pyrefly: ignore [missing-import]
-from huggingface_hub import hf_hub_download
+from PIL import Image, UnidentifiedImageError
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-HF_REPO = "farandev/dermai-skin-classifier"
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
 
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+MODEL_PATH = MODEL_DIR / "dermai_best.pt"
+META_PATH = MODEL_DIR / "model_meta.json"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ── Trained class names ────────────────────────────────────────────────────────
-# These are the canonical 10 classes our model is trained on
+# ---------------------------------------------------------------------
+# Class names
+# ---------------------------------------------------------------------
+
 CLASS_NAMES = [
     "melanoma",
     "basal_cell_carcinoma",
@@ -46,140 +56,294 @@ CLASS_NAMES = [
     "petechiae_purpura",
     "leukemia_cutis",
     "ecchymosis",
-    "normal_skin"
+    "normal_skin",
 ]
-NUM_CLASSES = len(CLASS_NAMES)  # 10
 
-# ── High-risk class definitions ───────────────────────────────────────────────
-HIGH_RISK_CLASSES = {"melanoma", "basal_cell_carcinoma", "leukemia_cutis"}
+NUM_CLASSES = len(CLASS_NAMES)
 
-SPECIAL_MESSAGES = {
-    "melanoma":
-        "Possible melanoma detected. This is a high-risk skin lesion. "
-        "Please see a dermatologist urgently — do not delay.",
-    "basal_cell_carcinoma":
-        "Possible basal cell carcinoma detected. "
-        "Please book a dermatologist appointment within 2 weeks.",
-    "leukemia_cutis":
-        "Possible leukemia cutis detected. This requires urgent oncology and dermatological evaluation.",
-    "actinic_keratosis":
-        "Possible actinic keratosis detected. This is a pre-cancerous lesion. Please consult a dermatologist.",
-    "petechiae_purpura":
-        "Possible petechiae/purpura detected. Recommend consulting a healthcare professional to rule out systemic causes.",
+# ---------------------------------------------------------------------
+# Risk categories
+# ---------------------------------------------------------------------
+
+HIGH_RISK_CLASSES = {
+    "melanoma",
+    "basal_cell_carcinoma",
+    "leukemia_cutis",
 }
 
-# ── Model loading ──────────────────────────────────────────────────────────────
-print("Loading DermAI model from local path: models/dermai_best.pt")
+SPECIAL_MESSAGES = {
+    "melanoma": (
+        "The model flagged a pattern associated with melanoma. "
+        "This result is not a diagnosis. Arrange prompt evaluation "
+        "by a qualified dermatologist."
+    ),
+    "basal_cell_carcinoma": (
+        "The model flagged a pattern associated with basal cell carcinoma. "
+        "Please consult a qualified dermatologist for evaluation."
+    ),
+    "leukemia_cutis": (
+        "The model flagged a pattern associated with leukemia cutis. "
+        "Please seek prompt medical evaluation."
+    ),
+    "actinic_keratosis": (
+        "The model flagged a pattern associated with actinic keratosis. "
+        "Please consult a qualified dermatologist."
+    ),
+    "petechiae_purpura": (
+        "The model flagged a pattern associated with petechiae or purpura. "
+        "Consult a healthcare professional for proper evaluation."
+    ),
+}
 
-try:
-    model_path = str(MODEL_DIR / "dermai_best.pt")
-    
-    # 1. Try JIT loading (TorchScript)
-    try:
-        _net = torch.jit.load(model_path, map_location=DEVICE)
-        print("Model loaded successfully as TorchScript JIT model.")
-    except Exception as e_jit:
-        print(f"JIT load failed: {e_jit}. Falling back to state dict...")
-        # 2. Try loading state dict
-        _ckpt = torch.load(model_path, map_location="cpu")
-        if isinstance(_ckpt, dict) and "classifier.bias" in _ckpt:
-            _ckpt_num_outputs = _ckpt["classifier.bias"].shape[0]
-            
-            # Read architecture from metadata if available
-            arch = "efficientnet_b4"  # Default fallback
-            meta_path = MODEL_DIR / "model_meta.json"
-            if meta_path.exists():
-                try:
-                    with open(meta_path) as f:
-                        meta = json.load(f)
-                        arch = meta.get("model_arch", arch)
-                except Exception:
-                    pass
-            
-            _net = timm.create_model(
-                arch,
-                pretrained=False,
-                num_classes=_ckpt_num_outputs
-            )
-            _net.load_state_dict(_ckpt)
-            _net.eval().to(DEVICE)
-            print(f"Model loaded successfully from state dict ({arch}).")
-        else:
-            raise RuntimeError("Unknown checkpoint format.")
-            
-    MODEL_LOADED = True
-    MODEL_PATH = model_path
+# ---------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------
 
-except Exception as e:
-    print(f"WARNING: Could not load trained model: {e}")
-    print("Falling back to random predictions until model is available.")
-    _net = None
-    MODEL_LOADED = False
-    MODEL_PATH = None
-
-# ── Image transform (matches training preprocessing) ──────────────────────────
-# EfficientNet-B3 uses 300x300 input resolution
 TRANSFORM = T.Compose([
     T.Resize((300, 300)),
     T.ToTensor(),
-    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    T.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225],
+    ),
 ])
 
-# ── Decision thresholds ───────────────────────────────────────────────────────
-HIGH_RISK_THRESHOLD = 0.40   # flag high-risk class if confidence >= this
-NORMAL_THRESHOLD    = 0.55   # below this → Medium risk for benign classes
+# ---------------------------------------------------------------------
+# Decision thresholds
+# ---------------------------------------------------------------------
+
+# These are application heuristics, not clinically validated thresholds.
+HIGH_RISK_THRESHOLD = 0.40
+NORMAL_THRESHOLD = 0.55
+
+# ---------------------------------------------------------------------
+# Model state
+# ---------------------------------------------------------------------
+
+_net = None
+MODEL_LOADED = False
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
-
-def classify_image(image_path: str, use_tta: bool | None = None) -> dict:
+def _load_model():
     """
-    Classify a skin lesion image using the trained EfficientNet-B4 model.
+    Load the local EfficientNet checkpoint.
 
-    Uses 6-fold Test-Time Augmentation (TTA) for more robust predictions (if enabled).
-    Extracts logits for the trained classes only and re-runs softmax so
-    confidence values correctly sum to 1.0.
+    Supports:
+    - TorchScript checkpoints
+    - Raw PyTorch state dictionaries
+    - State dictionaries wrapped in a 'state_dict' key
+
+    Raises RuntimeError if the model cannot be loaded.
+    """
+
+    global _net, MODEL_LOADED
+
+    if not MODEL_PATH.is_file():
+        raise RuntimeError(
+            f"Model checkpoint not found: {MODEL_PATH}"
+        )
+
+    logger.info("Loading DermAI model from %s", MODEL_PATH)
+
+    # First attempt: TorchScript
+    try:
+        model = torch.jit.load(
+            str(MODEL_PATH),
+            map_location=DEVICE,
+        )
+
+        model.eval()
+        _net = model
+        MODEL_LOADED = True
+
+        logger.info("EfficientNet model loaded as TorchScript.")
+        return
+
+    except Exception as jit_error:
+        logger.info(
+            "TorchScript loading failed; trying state dictionary: %s",
+            jit_error,
+        )
+
+    # Second attempt: regular PyTorch checkpoint
+    try:
+        checkpoint = torch.load(
+            str(MODEL_PATH),
+            map_location="cpu",
+            weights_only=True,
+        )
+
+        # Support checkpoints wrapped in a state_dict field.
+        if (
+            isinstance(checkpoint, dict)
+            and "state_dict" in checkpoint
+            and isinstance(checkpoint["state_dict"], dict)
+        ):
+            state_dict = checkpoint["state_dict"]
+        else:
+            state_dict = checkpoint
+
+        if not isinstance(state_dict, dict):
+            raise RuntimeError(
+                "Checkpoint does not contain a valid state dictionary."
+            )
+
+        # Detect classifier output layer.
+        if "classifier.bias" not in state_dict:
+            raise RuntimeError(
+                "Checkpoint is missing classifier.bias. "
+                "The model architecture may not match."
+            )
+
+        checkpoint_outputs = state_dict["classifier.bias"].shape[0]
+
+        if checkpoint_outputs != NUM_CLASSES:
+            raise RuntimeError(
+                f"Checkpoint has {checkpoint_outputs} outputs, "
+                f"but the application expects {NUM_CLASSES} classes."
+            )
+
+        # Read architecture from metadata.
+        architecture = "efficientnet_b4"
+
+        if META_PATH.is_file():
+            with open(META_PATH, "r", encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+
+            architecture = metadata.get(
+                "model_arch",
+                architecture,
+            )
+
+            metadata_classes = metadata.get("class_names")
+
+            if metadata_classes and metadata_classes != CLASS_NAMES:
+                raise RuntimeError(
+                    "Class names in model_meta.json do not match "
+                    "the classifier's configured class names."
+                )
+
+            metadata_outputs = metadata.get("num_classes")
+
+            if (
+                metadata_outputs is not None
+                and metadata_outputs != NUM_CLASSES
+            ):
+                raise RuntimeError(
+                    "num_classes in model_meta.json does not match "
+                    "the configured class count."
+                )
+
+        model = timm.create_model(
+            architecture,
+            pretrained=False,
+            num_classes=checkpoint_outputs,
+        )
+
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        model.to(DEVICE)
+
+        _net = model
+        MODEL_LOADED = True
+
+        logger.info(
+            "EfficientNet model loaded successfully. Architecture=%s, classes=%d",
+            architecture,
+            checkpoint_outputs,
+        )
+
+    except Exception as exc:
+        _net = None
+        MODEL_LOADED = False
+
+        logger.exception("Could not load the DermAI model.")
+
+        raise RuntimeError(
+            "The trained skin classification model could not be loaded. "
+            "Image analysis is unavailable."
+        ) from exc
+
+
+# Load model when this module is imported.
+try:
+    _load_model()
+
+except RuntimeError:
+    logger.exception(
+        "DermAI classifier is unavailable. "
+        "No predictions will be generated."
+    )
+
+
+# ---------------------------------------------------------------------
+# Public classification API
+# ---------------------------------------------------------------------
+
+def classify_image(
+    image_path: str,
+    use_tta: bool | None = None,
+) -> dict:
+    """
+    Classify a skin image using the loaded EfficientNet model.
 
     Args:
-        image_path: Path to the input image file.
-        use_tta: Whether to use 6-fold TTA. Defaults to True on GPU/CUDA and False on CPU.
+        image_path:
+            Path to the input image.
+
+        use_tta:
+            Whether to use six test-time augmentation passes.
+            Defaults to True on CUDA and False on CPU.
 
     Returns:
-        dict with keys:
-          predicted_class  : str   — one of CLASS_NAMES
-          confidence       : float — 0.0-1.0 (re-normalized)
-          risk_level       : str   — 'High' | 'Medium' | 'Low'
-          all_scores       : dict  — {class_name: confidence}
-          special_message  : str | None — clinical urgency message
-          disclaimer       : str
+        Dictionary containing:
+            predicted_class
+            confidence
+            risk_level
+            all_scores
+            special_message
+            disclaimer
+
+    Raises:
+        RuntimeError:
+            If the trained model is unavailable or inference fails.
+
+        ValueError:
+            If the input image cannot be opened.
     """
-    if use_tta is None:
-        use_tta = (DEVICE == "cuda")
 
     if not MODEL_LOADED or _net is None:
-        # Fallback: return mock scores if model failed to load
-        import random
-        raw = [random.uniform(0.05, 0.25) for _ in CLASS_NAMES]
-        raw[0] = 0.45  # bias toward first class
-        total = sum(raw)
-        scores = {CLASS_NAMES[i]: round(raw[i] / total, 4) for i in range(NUM_CLASSES)}
-        pred = max(scores, key=scores.get)
-        return {
-            "predicted_class": pred,
-            "confidence": scores[pred],
-            "risk_level": "Medium",
-            "all_scores": scores,
-            "special_message": "Model loading error — please check backend logs.",
-            "disclaimer": "Educational tool only. Not medical advice."
-        }
+        raise RuntimeError(
+            "The trained skin classification model is unavailable. "
+            "Please check the backend model checkpoint and startup logs."
+        )
+
+    if use_tta is None:
+        use_tta = DEVICE == "cuda"
+
+    # -------------------------------------------------------------
+    # Open and preprocess image
+    # -------------------------------------------------------------
 
     try:
-        img    = Image.open(image_path).convert("RGB")
-        tensor = TRANSFORM(img).unsqueeze(0).to(DEVICE)
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            tensor = TRANSFORM(image).unsqueeze(0).to(DEVICE)
 
-        with torch.no_grad():
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(
+            "The uploaded image could not be opened or processed. "
+            "Please upload a valid image."
+        ) from exc
+
+    # -------------------------------------------------------------
+    # Model inference
+    # -------------------------------------------------------------
+
+    try:
+        with torch.inference_mode():
+
             if use_tta:
-                # TTA — run 6 augmented versions, average raw logits for robustness
                 augments = [
                     lambda x: x,
                     lambda x: torch.flip(x, [2]),
@@ -188,76 +352,138 @@ def classify_image(image_path: str, use_tta: bool | None = None) -> dict:
                     lambda x: torch.rot90(x, 2, [2, 3]),
                     lambda x: torch.rot90(x, 3, [2, 3]),
                 ]
+
                 all_logits = []
-                for aug in augments:
-                    out = _net(aug(tensor))          # shape: (1, 10)
-                    all_logits.append(out[:, :NUM_CLASSES])
-                # Average logits across TTA views, then softmax
-                avg_logits = torch.stack(all_logits).mean(0)
+
+                for augment in augments:
+                    output = _net(augment(tensor))
+
+                    if output.ndim != 2 or output.shape[1] != NUM_CLASSES:
+                        raise RuntimeError(
+                            "Model output dimensions do not match "
+                            "the configured class count."
+                        )
+
+                    all_logits.append(output)
+
+                avg_logits = torch.stack(all_logits).mean(dim=0)
+
             else:
-                # Single forward pass — 6x faster on CPU
-                out = _net(tensor)
-                avg_logits = out[:, :NUM_CLASSES]
+                output = _net(tensor)
 
-        probs = F.softmax(avg_logits, dim=-1).squeeze()  # shape: (10,) sums to 1.0
+                if output.ndim != 2 or output.shape[1] != NUM_CLASSES:
+                    raise RuntimeError(
+                        "Model output dimensions do not match "
+                        "the configured class count."
+                    )
 
-        scores = {CLASS_NAMES[i]: round(float(probs[i]), 4) for i in range(NUM_CLASSES)}
+                avg_logits = output
 
-        # High-risk class priority check (lower threshold for safety)
-        best_hr_class = None
-        best_hr_score = 0.0
-        for cls in HIGH_RISK_CLASSES:
-            if cls in scores and scores[cls] > best_hr_score:
-                best_hr_score = scores[cls]
-                best_hr_class = cls
+            probabilities = F.softmax(
+                avg_logits,
+                dim=1,
+            ).squeeze(0)
 
-        if best_hr_score >= HIGH_RISK_THRESHOLD:
-            pred = best_hr_class
-            conf = best_hr_score
-            risk = "High"
+            scores = {
+                CLASS_NAMES[index]: round(
+                    float(probabilities[index].item()),
+                    4,
+                )
+                for index in range(NUM_CLASSES)
+            }
+
+        # ---------------------------------------------------------
+        # Select prediction
+        # ---------------------------------------------------------
+
+        best_high_risk_class = None
+        best_high_risk_score = 0.0
+
+        for class_name in HIGH_RISK_CLASSES:
+            score = scores[class_name]
+
+            if score > best_high_risk_score:
+                best_high_risk_score = score
+                best_high_risk_class = class_name
+
+        if best_high_risk_score >= HIGH_RISK_THRESHOLD:
+            predicted_class = best_high_risk_class
+            confidence = best_high_risk_score
+            risk_level = "High"
+
         else:
-            pred = max(scores, key=scores.get)
-            conf = scores[pred]
-            risk = ("High"   if pred in HIGH_RISK_CLASSES else
-                    "Medium" if conf < NORMAL_THRESHOLD    else "Low")
+            predicted_class = max(
+                scores,
+                key=scores.get,
+            )
 
-        # Clean up local tensors to prevent memory accumulation
-        del tensor
-        if 'out' in locals():
-            del out
-        if 'all_logits' in locals():
-            del all_logits
+            confidence = scores[predicted_class]
+
+            if predicted_class in HIGH_RISK_CLASSES:
+                risk_level = "High"
+
+            elif confidence < NORMAL_THRESHOLD:
+                risk_level = "Medium"
+
+            else:
+                risk_level = "Low"
+
+        # ---------------------------------------------------------
+        # Return result
+        # ---------------------------------------------------------
+
+        return {
+            "predicted_class": predicted_class,
+            "confidence": confidence,
+            "risk_level": risk_level,
+            "all_scores": scores,
+            "special_message": SPECIAL_MESSAGES.get(predicted_class),
+            "disclaimer": (
+                "Experimental educational output only. "
+                "Not a medical diagnosis or a substitute for "
+                "evaluation by a qualified healthcare professional."
+            ),
+        }
+
+    except Exception as exc:
+        logger.exception("DermAI image classification failed.")
+
+        raise RuntimeError(
+            "Image classification failed. Please try again later."
+        ) from exc
+
+    finally:
+        if "tensor" in locals():
+            del tensor
+
+        if "output" in locals():
+            del output
+
+        if "avg_logits" in locals():
+            del avg_logits
+
+        if "probabilities" in locals():
+            del probabilities
+
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-        return {
-            "predicted_class": pred,
-            "confidence":      conf,
-            "risk_level":      risk,
-            "all_scores":      scores,
-            "special_message": SPECIAL_MESSAGES.get(pred),
-            "disclaimer":      "Educational tool only. Not a substitute for medical diagnosis."
-        }
 
-
-    except Exception as e:
-        print(f"Classification error: {e}")
-        return {
-            "predicted_class": "unknown",
-            "confidence":      0.0,
-            "risk_level":      "Unknown",
-            "all_scores":      {},
-            "special_message": f"Error during classification: {str(e)}",
-            "disclaimer":      "Educational tool only."
-        }
-
+# ---------------------------------------------------------------------
+# Grad-CAM compatibility
+# ---------------------------------------------------------------------
 
 def _load_local_model():
     """
-    Return the already-loaded EfficientNet-B4 model instance.
+    Return the loaded EfficientNet model instance.
+
     Used by Grad-CAM to generate attention heatmaps.
-    Raises RuntimeError if the model failed to load at startup.
+    Raises RuntimeError if the model is unavailable.
     """
-    if _net is None:
-        raise RuntimeError("Model is not loaded — cannot generate Grad-CAM heatmap.")
+
+    if not MODEL_LOADED or _net is None:
+        raise RuntimeError(
+            "Model is not loaded. Cannot generate Grad-CAM heatmap."
+        )
+
     return _net

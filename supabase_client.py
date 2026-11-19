@@ -91,20 +91,111 @@ def update_analysis(analysis_id: str, data: dict) -> None:
         except Exception as e:
             print(f"Supabase update exception (non-fatal): {e}")
 
-def upload_to_storage(bucket: str, path: str, file_bytes: bytes) -> str:
-    """Upload binary file bytes to Supabase Storage or return local base64 Data URI."""
-    # If Supabase is available, try to upload
-    if supabase is not None:
-        try:
-            supabase.storage.from_(bucket).upload(
-                path=path,
-                file=file_bytes,
-                file_options={"content-type": "image/jpeg", "upsert": "true"}
-            )
-            return supabase.storage.from_(bucket).get_public_url(path)
-        except Exception as e:
-            print(f"Supabase storage upload failed: {e}")
 
-    # Fallback to local Data URI representation
-    encoded = base64.b64encode(file_bytes).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
+def upload_to_storage(bucket: str, path: str, file_bytes: bytes) -> str:
+    """
+    Upload an image to the private skin-images Supabase bucket
+    and return a temporary signed URL.
+    """
+
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase is not configured. Check SUPABASE_URL "
+            "and SUPABASE_SERVICE_KEY."
+        )
+
+    import uuid
+
+    safe_path = path.replace("\\", "/").lstrip("/")
+    object_path = f"{bucket}/{safe_path}"
+
+    try:
+        supabase.storage.from_("skin-images").upload(
+            path=object_path,
+            file=file_bytes,
+            file_options={
+                "content-type": "image/jpeg",
+                "upsert": "true"
+            }
+        )
+
+        result = supabase.storage.from_("skin-images").create_signed_url(
+            object_path,
+            3600
+        )
+
+        signed_url = result.get("signedURL") or result.get("signedUrl")
+
+        if not signed_url:
+            raise RuntimeError("Could not generate signed URL.")
+
+        if signed_url.startswith("/"):
+            signed_url = f"{_SUPABASE_URL}/storage/v1{signed_url}"
+
+        return signed_url
+
+    except Exception as e:
+        raise RuntimeError(f"Private Supabase image upload failed: {e}") from e
+
+def upload_image_to_storage(
+    object_path: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> str:
+    """
+    Upload an original user image to the private skin-images bucket.
+    Returns the permanent storage object path, not a temporary URL.
+    """
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase is not configured. Check SUPABASE_URL "
+            "and SUPABASE_SERVICE_KEY."
+        )
+
+    safe_path = object_path.replace("\\", "/").lstrip("/")
+
+    if not safe_path or ".." in safe_path.split("/"):
+        raise ValueError("Invalid Supabase storage path.")
+
+    try:
+        supabase.storage.from_("skin-images").upload(
+            path=safe_path,
+            file=file_bytes,
+            file_options={
+                "content-type": content_type,
+                "upsert": "false",
+            },
+        )
+        return safe_path
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Original image upload to Supabase failed: {e}"
+        ) from e
+
+
+def delete_from_storage(object_path: str) -> None:
+    """
+    Delete an object from the private skin-images bucket.
+    """
+    if not object_path:
+        return
+
+    if supabase is None:
+        raise RuntimeError(
+            "Supabase is not configured. Cannot delete stored image."
+        )
+
+    safe_path = object_path.replace("\\", "/").lstrip("/")
+
+    if not safe_path or ".." in safe_path.split("/"):
+        raise ValueError("Invalid Supabase storage path.")
+
+    try:
+        supabase.storage.from_("skin-images").remove([safe_path])
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Supabase image deletion failed: {e}"
+        ) from e
+
